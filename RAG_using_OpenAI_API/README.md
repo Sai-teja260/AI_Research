@@ -73,7 +73,7 @@ python3 main.py
 ```
 
 * Expect the welcome message:
-  **“Welcome to the AtliQ College Q\&A System! Ask about student GPA, fees, or general topics. Type 'quit' to exit.”**
+  **“Welcome to the College Q\&A System! Ask about student GPA, fees, or general topics. Type 'quit' to exit.”**
 
 * Test by asking:
 
