@@ -1,4 +1,4 @@
-**Steps to Run the Q\&A System Project**
+### Steps to Run the Q\&A System Project
 
 Follow these steps in order to set up and run the project:
 
