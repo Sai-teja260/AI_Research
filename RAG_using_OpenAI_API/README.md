@@ -1,5 +1,3 @@
----
-
 **Steps to Run the Q\&A System Project**
 
 Follow these steps in order to set up and run the project:
@@ -86,5 +84,3 @@ python3 main.py
     *(should return “The capital of France is Paris.”)*
 
 * Type **“quit”** to exit.
-
----
