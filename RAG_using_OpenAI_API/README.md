@@ -1,5 +1,3 @@
-Here is the text you asked for:
-
 ---
 
 **Steps to Run the Q\&A System Project**
