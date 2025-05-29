@@ -14,3 +14,4 @@ response = requests.post(
         "stream":False
     })
 )
+print(response.content)
