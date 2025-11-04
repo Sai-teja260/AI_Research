@@ -1,0 +1,353 @@
+Full-Duplex AI Voice on Raspberry Pi (No Echo, With Interrupt)
+1. What we’re trying to do
+
+Goal:
+
+Raspberry Pi listens to the microphone all the time
+
+Pi speaks back through a speaker
+
+You can interrupt (barge in) while it’s talking
+
+The Pi must not hear its own speaker and go into an infinite “echo loop”
+
+We do not fix this by muting the mic in Python.
+
+Instead, we make the audio system itself (PipeWire + PulseAudio) give us a clean, echo-cancelled microphone.
+
+2. Why the loop happens
+
+Without any special setup:
+
+Your mic hears:
+
+your voice
+
+plus whatever is coming from the speaker.
+
+Your Python code sends that mixed signal to the AI.
+
+The AI hears itself talking, thinks it’s you, and responds again.
+
+That new response is also heard → infinite loop.
+
+To fix it properly:
+
+We must subtract the speaker audio from the mic audio before Python ever sees it.
+That’s called acoustic echo cancellation (AEC).
+
+3. The moving parts
+
+On your Raspberry Pi:
+
+PipeWire – audio server
+
+pipewire-pulse – PulseAudio compatibility layer on top of PipeWire
+
+Echo-cancel module – creates a virtual source called source_ec
+
+Pulse default source – where apps (like PyAudio) get their mic input
+
+PyAudio – Python library used for mic + speaker
+
+OpenAI Realtime API – WebSocket that sends/receives audio/text
+
+The key trick:
+
+Make Python record from Pulse → Pulse reads from default source → default source is source_ec → source_ec is mic − speaker.
+
+So Python only sees your real voice, not its own speaker output.
+
+4. Check your audio stack
+
+Run:
+
+pactl info | grep "Server Name"
+
+
+You should see something like:
+
+Server Name: PulseAudio (on PipeWire 1.x.x)
+
+
+That means: PipeWire is running with Pulse emulation.
+
+Check inputs:
+
+pactl list sources short
+
+
+You eventually want to see something like:
+
+37  source_ec   PipeWire  float32le 2ch 48000Hz  SUSPENDED
+...
+
+
+If source_ec exists, echo cancellation is already loaded.
+If it doesn’t, see the next step.
+
+5. Enable echo cancellation (if source_ec is missing)
+
+If you don’t see source_ec, create this file:
+
+mkdir -p ~/.config/pipewire/pipewire.conf.d
+nano ~/.config/pipewire/pipewire.conf.d/60-echo-cancel.conf
+
+
+Put this inside:
+
+context.modules = [
+  {
+    name = libpipewire-module-echo-cancel
+    args = {
+      library.name = aec/libspa-aec-webrtc
+
+      # Optional: auto pick monitor of default sink
+      monitor.mode = true
+
+      source.props = {
+        node.name = "source_ec"
+        node.description = "Echo-cancelled source"
+      }
+    }
+  }
+]
+
+
+Save, then restart PipeWire:
+
+systemctl --user restart pipewire pipewire-pulse
+
+
+Check again:
+
+pactl list sources short
+
+
+You should now see source_ec.
+
+6. Make source_ec the default mic (this is the magic step)
+
+Run:
+
+pactl set-default-source source_ec
+pactl info | grep "Default Source"
+
+
+You want:
+
+Default Source: source_ec
+
+
+Now:
+
+Any app using the Pulse input device gets audio from source_ec.
+
+source_ec = mic with echo cancellation applied.
+
+You may need to run pactl set-default-source source_ec after each reboot,
+or add it to an autostart script. But for now, running it manually is fine.
+
+7. Test with a simple “parrot” (no AI, no muting)
+
+Create parrot_pulse.py:
+
+import pyaudio
+import queue
+import threading
+import time
+import array
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 16000
+CHUNK = 1024
+
+SILENCE_THRESHOLD = 500
+SILENCE_CHUNKS = 15  # ~1 second of silence
+
+mic_queue = queue.Queue()
+stop_event = threading.Event()
+mic_active = None
+
+
+def find_pulse_input(pa):
+    print("🔍 Scanning input devices:")
+    pulse_index = None
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        name = info.get("name", "")
+        max_in = info.get("maxInputChannels", 0)
+        print(f"  [{i}] {name} (inputs: {max_in})")
+        if max_in > 0 and "pulse" in name.lower():
+            pulse_index = i
+    if pulse_index is not None:
+        print(f"✅ Using Pulse input device index {pulse_index}")
+    else:
+        print("⚠️ No 'pulse' device found, using default input")
+    return pulse_index
+
+
+def mic_callback(in_data, frame_count, time_info, status_flags):
+    global mic_active
+    if mic_active is not True:
+        mic_active = True
+        print("🎙️ Mic capturing (Pulse -> Default Source)")
+    mic_queue.put(in_data)
+    return (None, pyaudio.paContinue)
+
+
+def is_silent(frame_bytes):
+    if not frame_bytes:
+        return True
+    data = array.array("h")
+    data.frombytes(frame_bytes)
+    if not data:
+        return True
+    max_amp = max(abs(x) for x in data)
+    return max_amp < SILENCE_THRESHOLD
+
+
+def worker(speaker_stream):
+    print("🔁 Worker started. Speak into the mic.")
+    while not stop_event.is_set():
+        try:
+            frame = mic_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        if is_silent(frame):
+            continue
+
+        print("🎧 Detected speech, recording utterance...")
+        utterance = [frame]
+        silence_count = 0
+
+        while not stop_event.is_set():
+            try:
+                frame = mic_queue.get(timeout=0.1)
+            except queue.Empty:
+                silence_count += 1
+                if silence_count > SILENCE_CHUNKS:
+                    break
+                continue
+
+            utterance.append(frame)
+
+            if is_silent(frame):
+                silence_count += 1
+                if silence_count > SILENCE_CHUNKS:
+                    break
+            else:
+                silence_count = 0
+
+        audio_data = b"".join(utterance)
+        print(f"🔊 Playing back {len(audio_data)} bytes (once)")
+        speaker_stream.write(audio_data)
+        print("✅ Playback done. Still listening...")
+
+
+def main():
+    pa = pyaudio.PyAudio()
+
+    pulse_index = find_pulse_input(pa)
+
+    mic_stream = pa.open(
+        format=FORMAT,
+        channels=CHANNELS,
+        rate=RATE,
+        input=True,
+        input_device_index=pulse_index if pulse_index is not None else None,
+        frames_per_buffer=CHUNK,
+        stream_callback=mic_callback,
+    )
+
+    speaker_stream = pa.open(
+        format=FORMAT,
+        channels=CHANNELS,
+        rate=RATE,
+        output=True,
+        frames_per_buffer=CHUNK,
+    )
+
+    t = threading.Thread(target=worker, args=(speaker_stream,))
+    t.start()
+
+    mic_stream.start_stream()
+
+    print("Press Ctrl+C to stop.")
+    try:
+        while mic_stream.is_active() and not stop_event.is_set():
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n🛑 KeyboardInterrupt, stopping...")
+        stop_event.set()
+    finally:
+        mic_stream.stop_stream()
+        mic_stream.close()
+        speaker_stream.stop_stream()
+        speaker_stream.close()
+        pa.terminate()
+        print("Bye.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+Install PyAudio if needed:
+
+sudo apt-get install python3-pyaudio
+
+
+Run:
+
+python3 parrot_pulse.py
+
+
+Expected behavior:
+
+You speak → it records that utterance.
+
+It plays you back once.
+
+It doesn’t endlessly replay its own playback (because source_ec removed the echo).
+
+The mic is never muted in code.
+
+If this works, your echo cancellation setup is correct.
+
+8. Add the AI back in
+
+Now your AI code (OpenAI Realtime) can stay almost exactly as you originally had it:
+
+The only important audio requirement is:
+
+Use the Pulse input device (like find_pulse_input above).
+
+Don’t manually mute the mic.
+
+On the server side, you can still use:
+
+turn_detection: { "type": "server_vad", ... }
+
+input_audio_buffer.speech_started event to cancel the current response and clear audio_buffer so it stops talking when you interrupt.
+
+Because the mic already gives clean audio (no echo), the AI won’t hear itself anymore, even if the mic is on 100% of the time.
+
+That’s why your original AI code suddenly “just works” now:
+we fixed the audio plumbing, not the logic.
+
+9. Summary in one paragraph
+
+We enabled PipeWire’s echo-cancel module, which created a virtual input source_ec.
+
+We set source_ec as the default Pulse source (pactl set-default-source source_ec).
+
+In Python, we used the Pulse device (pulse) as the mic source through PyAudio.
+
+That means: Python records from source_ec, which is mic with speaker signal removed.
+
+The mic can stay always on, you can interrupt the AI mid-sentence, and it never loops on its own voice.
+
+You can copy this doc into a README and any beginner following it should be able to reproduce your setup.
